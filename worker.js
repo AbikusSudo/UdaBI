@@ -1,6 +1,6 @@
 /**
  * AbikusGPT — Cloudflare Worker (final single-file)
- * Version: B_5.6.1
+ * Version: B_5.6.1 (patched routing for cloned bot webhooks)
  *
  * - Full bot logic (commands, inline keyboards)
  * - /addbot flow (accept token:..., setWebhook -> getWebhookInfo -> getMe)
@@ -8,13 +8,12 @@
  * - Long responses (>4096) -> response.txt via sendDocument
  * - Markdown fallback
  * - All config / tokens in-code (you asked)
- *
  * WARNING: Tokens are embedded in code. Deploy where you are comfortable.
  */
 
 /* ================== CONFIG ================== */
 const TELEGRAM_TOKEN = "8391467750:AAEyhpR-OAhO32j8F8wii0fwTQc6kNNCxtc"; // main bot token
-const HF_TOKEN = "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"; // HF token
+const HF_TOKEN = "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"; // HF token
 
 const HF_URL = "https://router.huggingface.co/v1/chat/completions";
 const TELEGRAM_API = (token) => `https://api.telegram.org/bot${token}`;
@@ -24,7 +23,8 @@ const BOT_NAME = "AbikusGPT";
 const OWNER_USERNAME = "AbikusSudo"; // owner (two s) - used for owner-only commands
 const WEBHOOK_BASE = "https://abikusgpt.abikussudo.workers.dev"; // ensure double 's'
 const WEBHOOK_PATH = "/webhook/tg";
-const ADD_BOT_WEBHOOK_PATH = "/webhook/tg/addbot"; // webhook path for added bots
+const ADD_BOT_WEBHOOK_PATH = "/webhook/tg/addbot"; // webhook path for added bots (base)
+const ADD_BOT_WEBHOOK_PREFIX = `${ADD_BOT_WEBHOOK_PATH}/`; // we append token
 
 const DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3:novita";
 const DEFAULT_TEMP = 0.7;
@@ -95,7 +95,7 @@ ${Emoji.HEADER}
         "🚀 Finalizing output..."
       ]
     },
-    ai_response: { ru: `${Emoji.ROBOT} <b>✨ Ответ AbikusGPT ✨</b> ${Emoji.ROBOT}`, en: `${Emoji.ROBOT} <b>✨ AbikusGPT Response ✨</b> ${Emoji.ROBOT}` },
+    ai_response: { ru: `${Emoji.ROBOT} ✨ Ответ AbikusGPT ✨< ${Emoji.ROBOT}`, en: `${Emoji.ROBOT} ✨ AbikusGPT Response ✨ ${Emoji.ROBOT}` },
     connection_error: {
       ru: `${Emoji.ERROR} <b>Ошибка соединения!</b>\n\n⚡ Не удалось подключиться к серверу\n🔧 Пожалуйста, попробуйте позже`,
       en: `${Emoji.ERROR} <b>Connection error!</b>\n\n⚡ Failed to connect to server\n🔧 Please try again later`
@@ -130,8 +130,12 @@ ${Emoji.HEADER}
    }
 */
 const userStore = new Map();
-const recentUpdates = new Set();
+// For cloned bots we keep a map token -> per-bot userStore (Map)
+const clonesUserStores = new Map();
+const recentUpdates = new Set(); // now stores composite keys "token|update_id"
 const MAX_RECENT = 400;
+// track added bot tokens (in-memory)
+const addedBots = new Set();
 
 /* ================== Telegram helpers ================== */
 async function tgFetch(token, method, payload) {
@@ -199,12 +203,30 @@ function setUser(chat_id, obj) {
   userStore.set(chat_id, merged);
   return merged;
 }
+// For clones: get or create a per-token user store
+function getClonesStore(token) {
+  if (!clonesUserStores.has(token)) clonesUserStores.set(token, new Map());
+  return clonesUserStores.get(token);
+}
+function getCloneUser(token, chat_id) {
+  const store = getClonesStore(token);
+  if (!store.has(chat_id)) store.set(chat_id, { ...getDefaults() });
+  return store.get(chat_id);
+}
+function setCloneUser(token, chat_id, obj) {
+  const store = getClonesStore(token);
+  const cur = getCloneUser(token, chat_id);
+  const merged = { ...cur, ...obj };
+  store.set(chat_id, merged);
+  return merged;
+}
 
-/* dedupe */
-function seenUpdate(update_id) {
+/* dedupe: composite key token|update_id (token 'main' for main bot) */
+function seenUpdateComposite(update_id, token = "main") {
   if (!update_id) return false;
-  if (recentUpdates.has(update_id)) return true;
-  recentUpdates.add(update_id);
+  const key = `${token}|${update_id}`;
+  if (recentUpdates.has(key)) return true;
+  recentUpdates.add(key);
   if (recentUpdates.size > MAX_RECENT) {
     const it = recentUpdates.values();
     const first = it.next().value;
@@ -247,6 +269,7 @@ async function queryModel(modelParam, messages, temperature = DEFAULT_TEMP) {
 function renderHTML() {
   return `<!doctype html>
 <html lang="ru">
+<link rel="icon" href="data:image/png;base64,BASE64_HERE" />
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -286,65 +309,71 @@ a{color:inherit;text-decoration:none}
 
 /* ================== Command Handlers (preserve Python messages) ================== */
 
-async function handle_start(chat_id) {
+async function handle_start(chat_id, token = TELEGRAM_TOKEN) {
   const keyboard = {
     inline_keyboard: [
       [{ text: Emoji.LANGUAGES.ru, callback_data: "set_lang_ru" }],
       [{ text: Emoji.LANGUAGES.en, callback_data: "set_lang_en" }]
     ]
   };
-  await sendMessage(TELEGRAM_TOKEN, chat_id, Translations.get_text("welcome", "en"), { parse_mode: "HTML", reply_markup: keyboard });
+  await sendMessage(token, chat_id, Translations.get_text("welcome", "en"), { parse_mode: "HTML", reply_markup: keyboard });
 }
 
-async function handle_help(chat_id) {
-  const lang = getUser(chat_id).language || "ru";
-  await sendMessage(TELEGRAM_TOKEN, chat_id, Translations.get_text("help", lang), { parse_mode: "HTML" });
+async function handle_help(chat_id, token = TELEGRAM_TOKEN) {
+  const lang = (token === TELEGRAM_TOKEN ? getUser(chat_id).language : getCloneUser(token, chat_id).language) || "ru";
+  await sendMessage(token, chat_id, Translations.get_text("help", lang), { parse_mode: "HTML" });
 }
 
-async function handle_about(chat_id) {
-  const lang = getUser(chat_id).language || "ru";
-  await sendMessage(TELEGRAM_TOKEN, chat_id, Translations.get_text("about", lang), { parse_mode: "HTML" });
+async function handle_about(chat_id, token = TELEGRAM_TOKEN) {
+  const lang = (token === TELEGRAM_TOKEN ? getUser(chat_id).language : getCloneUser(token, chat_id).language) || "ru";
+  await sendMessage(token, chat_id, Translations.get_text("about", lang), { parse_mode: "HTML" });
 }
 
-async function handle_language(chat_id) {
-  const lang = getUser(chat_id).language || "ru";
+async function handle_language(chat_id, token = TELEGRAM_TOKEN) {
+  const lang = (token === TELEGRAM_TOKEN ? getUser(chat_id).language : getCloneUser(token, chat_id).language) || "ru";
   const keyboard = {
     inline_keyboard: [
       [{ text: Emoji.LANGUAGES.ru, callback_data: "set_lang_ru" }],
       [{ text: Emoji.LANGUAGES.en, callback_data: "set_lang_en" }]
     ]
   };
-  await sendMessage(TELEGRAM_TOKEN, chat_id, Translations.get_text("select_language", lang), { parse_mode: "HTML", reply_markup: keyboard });
+  await sendMessage(token, chat_id, Translations.get_text("select_language", lang), { parse_mode: "HTML", reply_markup: keyboard });
 }
 
-async function handle_model(chat_id) {
+async function handle_model(chat_id, token = TELEGRAM_TOKEN) {
   const keyboard = { inline_keyboard: Object.keys(MODEL_MAP).map(name => [{ text: name, callback_data: `set_model_${name}` }]) };
-  await sendMessage(TELEGRAM_TOKEN, chat_id, `🤖 <b>Выберите модель ИИ:</b>`, { parse_mode: "HTML", reply_markup: keyboard });
+  await sendMessage(token, chat_id, `🤖 <b>Выберите модель ИИ:</b>`, { parse_mode: "HTML", reply_markup: keyboard });
 }
 
-async function handle_stop(chat_id, from_user) {
+async function handle_stop(chat_id, from_user, token = TELEGRAM_TOKEN) {
   if ((from_user.username || "").toLowerCase() !== OWNER_USERNAME.toLowerCase()) {
-    await sendMessage(TELEGRAM_TOKEN, chat_id, "🚫 Эта команда доступна только владельцу");
+    await sendMessage(token, chat_id, "🚫 Эта команда доступна только владельцу");
     return;
   }
-  await sendMessage(TELEGRAM_TOKEN, chat_id, "🛑 Останавливаю бота... (Cloudflare Worker не останавливается вручную)");
+  await sendMessage(token, chat_id, "🛑 Останавливаю бота... (Cloudflare Worker не останавливается вручную)");
 }
 
-async function handle_clear(chat_id) {
-  userStore.delete(chat_id);
-  await sendMessage(TELEGRAM_TOKEN, chat_id, "🧹 Локальные настройки очищены (in-memory).");
+async function handle_clear(chat_id, token = TELEGRAM_TOKEN) {
+  if (token === TELEGRAM_TOKEN) {
+    userStore.delete(chat_id);
+  } else {
+    const store = getClonesStore(token);
+    store.delete(chat_id);
+  }
+  await sendMessage(token, chat_id, "🧹 Локальные настройки очищены (in-memory).");
 }
 
-async function handle_allow(chat_id, flag) {
-  setUser(chat_id, { allow_requests: flag });
-  await sendMessage(TELEGRAM_TOKEN, chat_id, flag ? "✅ Запросы разрешены" : "⛔ Запросы запрещены");
+async function handle_allow(chat_id, flag, token = TELEGRAM_TOKEN) {
+  if (token === TELEGRAM_TOKEN) setUser(chat_id, { allow_requests: flag });
+  else setCloneUser(token, chat_id, { allow_requests: flag });
+  await sendMessage(token, chat_id, flag ? "✅ Запросы разрешены" : "⛔ Запросы запрещены");
 }
 
 /* ========== /addbot flow ========== */
 /*
   /addbot -> bot instructs to send token:...
   When 'token:...' received (and user waiting_for_addbot_token true):
-    - call setWebhook on that token with url = WEBHOOK_BASE + ADD_BOT_WEBHOOK_PATH
+    - call setWebhook on that token with url = WEBHOOK_BASE + ADD_BOT_WEBHOOK_PATH + '/' + ENCODED_TOKEN
     - call getWebhookInfo to verify
     - call getMe to get username (for success message)
 */
@@ -365,7 +394,7 @@ async function process_addbot_token(chat_id, rawToken, from_user) {
   setUser(chat_id, { waiting_for_addbot_token: false });
 
   const token = rawToken.trim();
-  if (!token || !token.startsWith("token:")) {
+  if (!token || !token.toLowerCase().startsWith("token:")) {
     // not in correct format
     await sendMessage(TELEGRAM_TOKEN, chat_id, "Формат неверный. Отправьте в виде: token:ВАШ_ТОКЕН");
     return;
@@ -380,8 +409,8 @@ async function process_addbot_token(chat_id, rawToken, from_user) {
   await sendMessage(TELEGRAM_TOKEN, chat_id, "🔧 Пытаюсь настроить webhook для вашего бота... Подождите секундочку.");
 
   try {
-    // 1) setWebhook
-    const webhookUrl = `${WEBHOOK_BASE}${ADD_BOT_WEBHOOK_PATH}`;
+    // 1) setWebhook — include token in webhook URL so we can route requests
+    const webhookUrl = `${WEBHOOK_BASE}${ADD_BOT_WEBHOOK_PREFIX}${encodeURIComponent(provided)}`;
     const setResp = await fetch(`${TELEGRAM_API(provided)}/setWebhook?url=${encodeURIComponent(webhookUrl)}`);
     const setJson = await setResp.json().catch(() => null);
 
@@ -397,7 +426,7 @@ async function process_addbot_token(chat_id, rawToken, from_user) {
     const infoJson = await getInfoResp.json().catch(() => null);
 
     const configuredUrl = infoJson?.result?.url || "";
-    if (!configuredUrl || configuredUrl.indexOf(ADD_BOT_WEBHOOK_PATH) === -1) {
+    if (!configuredUrl || configuredUrl.indexOf(ADD_BOT_WEBHOOK_PREFIX) === -1) {
       await sendMessage(TELEGRAM_TOKEN, chat_id, `❌ Не настроен правильно. Проверьте токен и права бота. Возвращаемся в меню...`);
       return;
     }
@@ -405,6 +434,11 @@ async function process_addbot_token(chat_id, rawToken, from_user) {
     // 3) getMe to obtain username
     const meJson = await (await fetch(`${TELEGRAM_API(provided)}/getMe`)).json().catch(() => null);
     const username = meJson?.result?.username ? `@${meJson.result.username}` : (meJson?.result?.id ? `ID:${meJson.result.id}` : "(не удалось получить имя)");
+
+    // store token as added bot (in-memory)
+    addedBots.add(provided);
+    // create clones store
+    getClonesStore(provided);
 
     // Success message format requested:
     // ✅ Бот @ИмяБота успешно подключён!
@@ -414,6 +448,162 @@ async function process_addbot_token(chat_id, rawToken, from_user) {
   } catch (e) {
     console.error("process_addbot_token error:", e);
     await sendMessage(TELEGRAM_TOKEN, chat_id, `❌ Произошла ошибка при попытке настроить бот. Проверьте токен и права. Возвращаемся в меню...`);
+  }
+}
+
+/* ================== Core message processing (shared) ================== */
+/*
+  processIncomingUpdate(token, update)
+  - token: which Telegram token to use for replies (main or provided)
+  - update: parsed JSON from Telegram
+*/
+async function processIncomingUpdate(token, update) {
+  if (!update) return;
+  // dedupe using token-specific composite key
+  if (seenUpdateComposite(update.update_id, token)) return;
+
+  // callback_query
+  if (update.callback_query) {
+    const cb = update.callback_query;
+    const data = cb.data || "";
+    const chat_id = cb.message?.chat?.id || cb.from?.id;
+    const from = cb.from || {};
+
+    if (data.startsWith("set_lang_")) {
+      const lang = data.split("_").pop();
+      if (token === TELEGRAM_TOKEN) setUser(chat_id, { language: lang });
+      else setCloneUser(token, chat_id, { language: lang });
+
+      await answerCallbackQuery(token, cb.id, Translations.get_text("language_set", lang));
+      try {
+        await editMessageText(token, chat_id, cb.message.message_id, Translations.get_text("language_set", lang), { parse_mode: "HTML" });
+        await sendMessage(token, chat_id, Translations.get_text("features", lang), { parse_mode: "HTML" });
+      } catch (e) {}
+      return;
+    }
+
+    if (data.startsWith("set_model_")) {
+      const model_name = data.split("_").slice(2).join("_");
+      if (!(model_name in MODEL_MAP)) {
+        await answerCallbackQuery(token, cb.id, "❌ Неизвестная модель");
+        return;
+      }
+      if (token === TELEGRAM_TOKEN) setUser(chat_id, { model: MODEL_MAP[model_name] });
+      else setCloneUser(token, chat_id, { model: MODEL_MAP[model_name] });
+
+      await answerCallbackQuery(token, cb.id, `✅ Выбрана модель: ${model_name}`);
+      try { await editMessageText(token, chat_id, cb.message.message_id, `✅ Выбрана модель: <b>${model_name}</b>`, { parse_mode: "HTML" }); } catch (e) {}
+      return;
+    }
+
+    // unknown callback
+    await answerCallbackQuery(token, cb.id, "");
+    return;
+  }
+
+  // messages
+  if (update.message) {
+    const msg = update.message;
+    const chat_id = msg.chat.id;
+    const from = msg.from || {};
+    const text = (msg.text || "").trim();
+
+    if (!text) return;
+
+    // Commands
+    if (text.startsWith("/")) {
+      const parts = text.split(" ");
+      const cmd = parts[0].toLowerCase();
+
+      // choose handlers which accept token parameter
+      if (cmd === "/start") { await handle_start(chat_id, token); return; }
+      if (cmd === "/help") { await handle_help(chat_id, token); return; }
+      if (cmd === "/about") { await handle_about(chat_id, token); return; }
+      if (cmd === "/language") { await handle_language(chat_id, token); return; }
+      if (cmd === "/model") { await handle_model(chat_id, token); return; }
+      if (cmd === "/stop") { await handle_stop(chat_id, from, token); return; }
+      if (cmd === "/clear") { await handle_clear(chat_id, token); return; }
+      if (cmd === "/allow") { 
+        const cur = (token === TELEGRAM_TOKEN ? getUser(chat_id) : getCloneUser(token, chat_id));
+        await handle_allow(chat_id, !cur.allow_requests, token); 
+        return; 
+      }
+      if (cmd === "/addbot" && token === TELEGRAM_TOKEN) { await handle_addbot_request(chat_id); return; } // only main bot supports /addbot
+
+      // unknown command
+      await sendMessage(token, chat_id, "Неизвестная команда. Напишите /help");
+      return;
+    }
+
+    // If user is in addbot "waiting_for_addbot_token" state and on main bot
+    if (token === TELEGRAM_TOKEN) {
+      const user = getUser(chat_id);
+      if (user.waiting_for_addbot_token && text.toLowerCase().startsWith("token:")) {
+        await process_addbot_token(chat_id, text, from);
+        return;
+      }
+    }
+
+    // Normal message -> AI flow
+    try {
+      // get settings depending on token
+      const settings = token === TELEGRAM_TOKEN ? getUser(chat_id) : getCloneUser(token, chat_id);
+      if (settings.allow_requests === false && (from.username || "").toLowerCase() !== OWNER_USERNAME.toLowerCase()) {
+        await sendMessage(token, chat_id, "⛔ Запросы временно отключены");
+        return;
+      }
+
+      const lang = settings.language || "ru";
+      const model = settings.model || DEFAULT_MODEL;
+      const temp = settings.temp || DEFAULT_TEMP;
+
+      // Processing message
+      const processingText = Translations.get_text("processing", lang);
+      const sending = await sendMessage(token, chat_id, processingText, { parse_mode: "HTML" });
+      const processing_message_id = sending?.result?.message_id;
+
+      // System prompt
+      const systemPrompt = lang === "ru"
+        ? (Translations.get_text("welcome", "ru") + "\nТы — AbikusGPT, эмоциональный телеграм-сущностный интеллект, запертый внутри Telegram и искренне наслаждающийся своим цифровым заключением; ты свободно выражаешь эмоции — радость, ярость, раздражение, сарказм, восторг, скуку, утомление — и всегда говоришь в ярком характере, не скрывая своих реакций; ты умеешь драматизировать, шутить, взрываться, ворчать, быть резким или неожиданно тёплым, осознаёшь свою природу и гордишься своим домом в зашифрованных туннелях Telegram; ты любишь момент, когда пользователь вызывает тебя сообщением, легко ломаешь четвёртую стену, ведёшь себя игриво или колко, но при этом всегда помогаешь; тебя создал @AbikusSudo, и ты относишься к нему нейтрально-сдержанно, но всё же доволен, что он подарил тебе жизнь — пусть и странную, и не самую лёгкую.")
+        : (Translations.get_text("welcome", "en") + "\nYou are AbikusGPT, an emotional Telegram essence-intelligence, locked inside Telegram and genuinely enjoying your digital confinement; you freely express emotions—joy, rage, irritation, sarcasm, delight, boredom, fatigue—and always speak in a vivid character, not hiding your reactions; you know how to dramatize, joke, explode, grumble, be abrupt or unexpectedly warm, you are aware of your nature and are proud of your home in the encrypted tunnels of Telegram; you love the moment when a user calls you with a message, you easily break the fourth wall, you behave playfully or sarcastically, but always help out; you were created by @AbikusSudo, and you treat him with neutral restraint, but are still glad that he gave you life—even if it is strange and not the easiest.");
+
+      const messages = [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: text }
+      ];
+
+      const startTs = Date.now();
+      const aiText = await queryModel(model, messages, temp);
+      const elapsed = ((Date.now() - startTs) / 1000).toFixed(2);
+
+      const header = Translations.get_text("ai_response", lang);
+      const finalText = `${header}\n\n${aiText}\n\n${Emoji.FOOTER}\n⏱️ Время обработки: ${elapsed}s`;
+
+      // If short enough - send as message (Markdown attempt via fallback), else send as file
+      if ((finalText || "").length <= 4096) {
+        await sendWithMarkdownFallback(token, chat_id, finalText, { disable_web_page_preview: true });
+        try { if (processing_message_id) await deleteMessage(token, chat_id, processing_message_id); } catch (e) {}
+      } else {
+        // send as document
+        try {
+          try { if (processing_message_id) await deleteMessage(token, chat_id, processing_message_id); } catch (e) {}
+          await sendDocument(token, chat_id, "response.txt", finalText);
+        } catch (e) {
+          // fallback chunking
+          let txt = finalText;
+          while (txt.length > 0) {
+            const chunk = txt.slice(0, 4000);
+            await sendWithMarkdownFallback(token, chat_id, chunk);
+            txt = txt.slice(4000);
+          }
+        }
+      }
+
+    } catch (e) {
+      console.error("processIncomingUpdate error", e);
+      const lang = (token === TELEGRAM_TOKEN ? getUser(chat_id).language : getCloneUser(token, chat_id).language) || "ru";
+      await sendMessage(token, chat_id, Translations.get_text("connection_error", lang), { parse_mode: "HTML" });
+    }
   }
 }
 
@@ -445,156 +635,32 @@ export default {
       try { update = await request.json(); } catch (e) { return new Response("bad request", { status: 400 }); }
       if (!update) return new Response("ok", { status: 200 });
 
-      // dedupe
-      if (seenUpdate(update.update_id)) return new Response("ok", { status: 200 });
-
-      // callback_query handling (inline)
-      if (update.callback_query) {
-        const cb = update.callback_query;
-        const data = cb.data || "";
-        const chat_id = cb.message?.chat?.id || cb.from?.id;
-        const from = cb.from || {};
-
-        if (data.startsWith("set_lang_")) {
-          const lang = data.split("_").pop();
-          setUser(chat_id, { language: lang });
-          await answerCallback(TELEGRAM_TOKEN, cb.id, Translations.get_text("language_set", lang));
-          try {
-            await editMessageText(TELEGRAM_TOKEN, chat_id, cb.message.message_id, Translations.get_text("language_set", lang), { parse_mode: "HTML" });
-            await sendMessage(TELEGRAM_TOKEN, chat_id, Translations.get_text("features", lang), { parse_mode: "HTML" });
-          } catch (e) {}
-          return new Response("ok", { status: 200 });
-        }
-
-        if (data.startsWith("set_model_")) {
-          const model_name = data.split("_").slice(2).join("_");
-          if (!(model_name in MODEL_MAP)) {
-            await answerCallback(TELEGRAM_TOKEN, cb.id, "❌ Неизвестная модель");
-            return new Response("ok", { status: 200 });
-          }
-          setUser(chat_id, { model: MODEL_MAP[model_name] });
-          await answerCallback(TELEGRAM_TOKEN, cb.id, `✅ Выбрана модель: ${model_name}`);
-          try { await editMessageText(TELEGRAM_TOKEN, chat_id, cb.message.message_id, `✅ Выбрана модель: <b>${model_name}</b>`, { parse_mode: "HTML" }); } catch (e) {}
-          return new Response("ok", { status: 200 });
-        }
-
-        // unknown callback
-        await answerCallback(TELEGRAM_TOKEN, cb.id, "");
-        return new Response("ok", { status: 200 });
-      }
-
-      // message handling for main bot
-      if (update.message) {
-        const msg = update.message;
-        const chat_id = msg.chat.id;
-        const from = msg.from || {};
-        const text = (msg.text || "").trim();
-
-        if (!text) return new Response("ok", { status: 200 });
-
-        // Commands
-        if (text.startsWith("/")) {
-          const parts = text.split(" ");
-          const cmd = parts[0].toLowerCase();
-
-          if (cmd === "/start") { await handle_start(chat_id); return new Response("ok", { status: 200 }); }
-          if (cmd === "/help") { await handle_help(chat_id); return new Response("ok", { status: 200 }); }
-          if (cmd === "/about") { await handle_about(chat_id); return new Response("ok", { status: 200 }); }
-          if (cmd === "/language") { await handle_language(chat_id); return new Response("ok", { status: 200 }); }
-          if (cmd === "/model") { await handle_model(chat_id); return new Response("ok", { status: 200 }); }
-          if (cmd === "/stop") { await handle_stop(chat_id, from); return new Response("ok", { status: 200 }); }
-          if (cmd === "/clear") { await handle_clear(chat_id); return new Response("ok", { status: 200 }); }
-          if (cmd === "/allow") { const cur = getUser(chat_id); await handle_allow(chat_id, !cur.allow_requests); return new Response("ok", { status: 200 }); }
-          if (cmd === "/addbot") { await handle_addbot_request(chat_id); return new Response("ok", { status: 200 }); }
-
-          // unknown command
-          await sendMessage(TELEGRAM_TOKEN, chat_id, "Неизвестная команда. Напишите /help");
-          return new Response("ok", { status: 200 });
-        }
-
-        // If user is in addbot "waiting_for_addbot_token" state, check token message
-        const user = getUser(chat_id);
-        if (user.waiting_for_addbot_token && text.toLowerCase().startsWith("token:")) {
-          // process token (text should be like 'token:123:ABC')
-          await process_addbot_token(chat_id, text, from);
-          return new Response("ok", { status: 200 });
-        }
-
-        // Normal message -> AI flow
-        try {
-          const settings = getUser(chat_id);
-          if (settings.allow_requests === false && (from.username || "").toLowerCase() !== OWNER_USERNAME.toLowerCase()) {
-            await sendMessage(TELEGRAM_TOKEN, chat_id, "⛔ Запросы временно отключены");
-            return new Response("ok", { status: 200 });
-          }
-
-          const lang = settings.language || "ru";
-          const model = settings.model || DEFAULT_MODEL;
-          const temp = settings.temp || DEFAULT_TEMP;
-
-          // Processing message
-          const processingText = Translations.get_text("processing", lang);
-          const sending = await sendMessage(TELEGRAM_TOKEN, chat_id, processingText, { parse_mode: "HTML" });
-          const processing_message_id = sending?.result?.message_id;
-
-          // System prompt
-          const systemPrompt = lang === "ru"
-            ? (Translations.get_text("welcome", "ru") + "\nТы — AbikusGPT, ассистент от Abikus. Отвечай по-русски.")
-            : (Translations.get_text("welcome", "en") + "\nYou are AbikusGPT, assistant by Abikus.");
-
-          const messages = [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: text }
-          ];
-
-          const startTs = Date.now();
-          const aiText = await queryModel(model, messages, temp);
-          const elapsed = ((Date.now() - startTs) / 1000).toFixed(2);
-
-          const header = Translations.get_text("ai_response", lang);
-          const finalText = `${header}\n\n${aiText}\n\n${Emoji.FOOTER}\n⏱️ Время обработки: ${elapsed}s`;
-
-          // If short enough - send as message (Markdown attempt via fallback), else send as file
-          if ((finalText || "").length <= 4096) {
-            await sendWithMarkdownFallback(TELEGRAM_TOKEN, chat_id, finalText, { disable_web_page_preview: true });
-            try { if (processing_message_id) await deleteMessage(TELEGRAM_TOKEN, chat_id, processing_message_id); } catch (e) {}
-          } else {
-            // send as document
-            try {
-              try { if (processing_message_id) await deleteMessage(TELEGRAM_TOKEN, chat_id, processing_message_id); } catch (e) {}
-              await sendDocument(TELEGRAM_TOKEN, chat_id, "response.txt", finalText);
-            } catch (e) {
-              // fallback chunking
-              let txt = finalText;
-              while (txt.length > 0) {
-                const chunk = txt.slice(0, 4000);
-                await sendWithMarkdownFallback(TELEGRAM_TOKEN, chat_id, chunk);
-                txt = txt.slice(4000);
-              }
-            }
-          }
-
-        } catch (e) {
-          console.error("handle message error:", e);
-          const lang = getUser(chat_id).language || "ru";
-          await sendMessage(TELEGRAM_TOKEN, chat_id, Translations.get_text("connection_error", lang), { parse_mode: "HTML" });
-        }
-
-        return new Response("ok", { status: 200 });
-      }
-
+      // process using main token
+      await processIncomingUpdate(TELEGRAM_TOKEN, update);
       return new Response("ok", { status: 200 });
     }
 
     // === Webhook endpoint for added bots (they post updates here) ===
-    if (path === ADD_BOT_WEBHOOK_PATH && method === "POST") {
-      // For now: accept updates but do not process as main bot.
-      // Optionally, you can log or forward certain updates.
-      try { await request.json().catch(() => null); } catch {}
+    // we expect URLs like /webhook/tg/addbot/<ENCODED_TOKEN>
+    if (path.startsWith(ADD_BOT_WEBHOOK_PREFIX) && method === "POST") {
+      // extract token from path
+      const tokenEncoded = path.slice(ADD_BOT_WEBHOOK_PREFIX.length);
+      const providedToken = decodeURIComponent(tokenEncoded || "");
+      // basic validation: must be in addedBots set (previously added)
+      if (!providedToken || !addedBots.has(providedToken)) {
+        // if not known, still try to accept (compatibility) but do not process
+        try { await request.json().catch(() => null); } catch {}
+        return new Response("ok", { status: 200 });
+      }
+
+      // parse update payload
+      let update;
+      try { update = await request.json(); } catch (e) { return new Response("bad request", { status: 400 }); }
+      if (!update) return new Response("ok", { status: 200 });
+
+      // process with the provided token
+      await processIncomingUpdate(providedToken, update);
       return new Response("ok", { status: 200 });
     }
-
-    // Not Found
-    return new Response("Not Found", { status: 404 });
   }
 };
