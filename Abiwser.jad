@@ -1,0 +1,8 @@
+MIDlet-Name: Abiwser
+MIDlet-Version: 1.0.0
+MIDlet-Vendor: Abikus
+MIDlet-1: Abiwser, , app.Abiwser
+MicroEdition-Profile: MIDP-2.0
+MicroEdition-Configuration: CLDC-1.1
+MIDlet-Jar-Size: 3825
+MIDlet-Jar-URL: Abiwser.jar
